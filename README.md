@@ -34,7 +34,7 @@ You can use the pre-built image from GitHub Container Registry:
 docker run -it \
   -v $(pwd)/config.yml:/app/config.yml \
   -v $(pwd)/data:/app/data \
-  ghcr.io/omidz4t/deltabot_telegram_bridge:main --init
+  ghcr.io/omidz4t/deltachat_telegram_bridge_bot:main --init
 
 # 2. Run
 docker run -d \
@@ -42,7 +42,7 @@ docker run -d \
   -v $(pwd)/config.yml:/app/config.yml \
   -v $(pwd)/data:/app/data \
   --restart unless-stopped \
-  ghcr.io/omidz4t/deltabot_telegram_bridge:main
+  ghcr.io/omidz4t/deltachat_telegram_bridge_bot:main
 ```
 
 ## License
