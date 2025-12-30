@@ -12,13 +12,10 @@ channels_to_mirror:
     delta_chat_chat_id: 10
     send_start: false
     chat_id: 10
-  - tgid: -1001234567891
-    username: your_another_telegram_channel
-    channel_photo_mode: auto
+  - username: your_another_telegram_channel_alternative_join_with_username_on_init
     delta_chat_account: 1
     delta_chat_chat_id: 11
-    send_start: false
-    chat_id: 11
+  
 
 
 telegram:

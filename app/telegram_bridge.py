@@ -8,6 +8,7 @@ from telethon.tl.functions.messages import ReadMentionsRequest
 from deltachat2 import MsgData, Rpc
 from logger import logger
 from models.message import Message
+from config_utils import save_config
 
 class TelegramBridge:
     def __init__(self, config, rpc: Rpc, msg_repo=None):
@@ -32,6 +33,46 @@ class TelegramBridge:
         self.channels_to_mirror = config.get("channels_to_mirror", [])
         if not self.channels_to_mirror and "out_channel" in config:
             self.channels_to_mirror = [config["out_channel"]]
+
+    async def _resolve_and_join_channel(self, channel_cfg, accid, sync_info_now=False):
+        tgid = channel_cfg.get('tgid')
+        username = channel_cfg.get('username')
+        dc_chat_id = channel_cfg.get('chat_id')
+        photo_mode = channel_cfg.get('channel_photo_mode', 'manual')
+        
+        # Prioritize username for public channels as it's easier to resolve for joining
+        target_chat = username or tgid
+        if not target_chat:
+            logger.warning(f"No tgid or username for channel config: {channel_cfg}")
+            return None
+            
+        if isinstance(target_chat, str) and (target_chat.startswith('-') or target_chat.isdigit()):
+            try:
+                target_chat = int(target_chat)
+            except ValueError:
+                pass
+
+        try:
+            entity = await self.client.get_entity(target_chat)
+            
+            # Ensure member
+            if getattr(entity, 'left', False):
+                logger.info(f"Joining Telegram channel: {target_chat}")
+                await self.client(JoinChannelRequest(entity))
+            
+            actual_tg_id = utils.get_peer_id(entity)
+            if channel_cfg.get('tgid') != actual_tg_id:
+                logger.info(f"Updating tgid for {target_chat}: {channel_cfg.get('tgid')} -> {actual_tg_id}")
+                channel_cfg['tgid'] = actual_tg_id
+                save_config(self.config)
+
+            if sync_info_now or photo_mode == 'auto':
+                await self.sync_channel_info(entity, dc_chat_id, accid)
+            
+            return actual_tg_id
+        except Exception as e:
+            logger.error(f"Could not resolve/join entity for {target_chat}: {e}")
+            return None
 
     async def run(self):
         if not self.api_id or not self.api_hash:
@@ -58,42 +99,11 @@ class TelegramBridge:
         target_chats = []
 
         for channel_cfg in self.channels_to_mirror:
-            tgid = channel_cfg.get('tgid')
-            username = channel_cfg.get('username')
             dc_chat_id = channel_cfg.get('chat_id')
-            photo_mode = channel_cfg.get('channel_photo_mode', 'manual')
-            
-            target_chat = None
-            if tgid:
-                try:
-                    target_chat = int(tgid)
-                except:
-                    pass
-            if not target_chat:
-                target_chat = username
-            
-            if not target_chat:
-                logger.warning(f"No tgid or username for channel config: {channel_cfg}")
-                continue
-
-            # Ensure member
-            try:
-                logger.info(f"Ensuring member of Telegram channel: {target_chat}")
-                await self.client(JoinChannelRequest(target_chat))
-            except Exception as e:
-                logger.warning(f"Note on joining Telegram channel {target_chat}: {e}")
-
-            # Get actual ID if it was a username
-            try:
-                entity = await self.client.get_entity(target_chat)
-                actual_tg_id = utils.get_peer_id(entity)
+            actual_tg_id = await self._resolve_and_join_channel(channel_cfg, accid)
+            if actual_tg_id:
                 tg_to_dc_map[actual_tg_id] = dc_chat_id
                 target_chats.append(actual_tg_id)
-                
-                if photo_mode == 'auto':
-                    await self.sync_channel_info(entity, dc_chat_id, accid)
-            except Exception as e:
-                logger.error(f"Could not resolve entity for {target_chat}: {e}")
 
         if not target_chats:
             logger.error("No valid Telegram channels to mirror.")
@@ -246,22 +256,7 @@ async def sync_tg_info_to_dc_async(config, rpc):
         
         accid = config.get('active_accid')
         for channel_cfg in bridge.channels_to_mirror:
-            if channel_cfg.get('channel_photo_mode') != 'auto':
-                continue
-                
-            tgid = channel_cfg.get('tgid')
-            username = channel_cfg.get('username')
-            dc_chat_id = channel_cfg.get('chat_id')
-            
-            target_chat = tgid or username
-            if not target_chat or not dc_chat_id:
-                continue
-                
-            try:
-                entity = await client.get_entity(target_chat)
-                await bridge.sync_channel_info(entity, dc_chat_id, accid)
-            except Exception as e:
-                logger.warning(f"Could not sync info for {target_chat}: {e}")
+            await bridge._resolve_and_join_channel(channel_cfg, accid, sync_info_now=True)
 
 def sync_tg_info_to_dc(config, rpc):
     asyncio.run(sync_tg_info_to_dc_async(config, rpc))

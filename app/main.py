@@ -20,19 +20,7 @@ from models.channel import Channel
 from db import init_db
 from telegram_bridge import start_telegram_bridge, init_telegram_session, sync_tg_info_to_dc
 
-def load_config():
-    config_path = Path("config.yml")
-    if config_path.exists():
-        with open(config_path, "r") as f:
-            return yaml.safe_load(f)
-    return {}
-
-def save_config(config):
-    config_path = Path("config.yml")
-    if not config_path.exists():
-        config_path.touch()
-    with open(config_path, "w") as f:
-        yaml.safe_dump(config, f)
+from config_utils import load_config, save_config
 
 def process_init_events(bot: Bot):
     events_to_log = (EventType.INFO, EventType.WARNING, EventType.ERROR)
