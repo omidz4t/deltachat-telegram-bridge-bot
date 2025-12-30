@@ -60,7 +60,7 @@ def process_init_events(bot: Bot):
                 else:
                     logger.info(msg)
             
-            if last_progress >= 1000 or event.kind == EventType.CONFIGURE_PROGRESS and event.progress >= 1000:
+            if last_progress >= 1000 or (event.kind == EventType.CONFIGURE_PROGRESS and event.progress >= 1000):
                 break
         except Exception as e:
             logger.error(f"Error in event processing: {e}")
@@ -92,20 +92,18 @@ def init_account(bot: Bot, addr: str):
         logger.error("Configuration failed or still in progress.")
         sys.exit(1)
 
-def setup_channel(bot: Bot, accid: int) -> int:
-    config = load_config()
-    out_channel = config.get("out_channel", {})
-    name = out_channel.get("name", "Telegram Bridge Channel")
-    avatar = out_channel.get("avatar")
-    chat_id = out_channel.get("chat_id")
+def setup_channel(bot: Bot, accid: int, channel_cfg: dict) -> int:
+    name = channel_cfg.get("name", channel_cfg.get("username", "Telegram Bridge Channel"))
+    avatar = channel_cfg.get("avatar")
+    chat_id = channel_cfg.get("chat_id")
     
     if chat_id:
         try:
             bot.rpc.get_basic_chat_info(accid, chat_id)
-            logger.info(f"Using existing broadcast channel {chat_id} from config.")
-            bot.rpc.set_chat_name(accid, chat_id, name)
+            logger.info(f"Using existing broadcast channel {chat_id} for {name}.")
+            # bot.rpc.set_chat_name(accid, chat_id, name)
         except JsonRpcError:
-            logger.warning(f"Channel {chat_id} from config not found in database. Creating a new one.")
+            logger.warning(f"Channel {chat_id} not found in database. Creating a new one.")
             chat_id = None
 
     if not chat_id:
@@ -116,12 +114,9 @@ def setup_channel(bot: Bot, accid: int) -> int:
             bot.rpc.set_chat_visibility(accid, chat_id, "Normal")
         except:
             pass
-        if "out_channel" not in config:
-            config["out_channel"] = {}
-        config["out_channel"]["chat_id"] = chat_id
-        config["active_accid"] = accid
-        save_config(config)
-        if out_channel.get("send_start", False):
+        
+        channel_cfg["chat_id"] = chat_id
+        if channel_cfg.get("send_start", False):
             # Initial promotion
             bot.rpc.send_msg(accid, chat_id, MsgData(text="start"))
     else:
@@ -144,9 +139,15 @@ def setup_channel(bot: Bot, accid: int) -> int:
 def run_bot(rpc: Rpc, hooks: HookCollection):
     config = load_config()
     active_accid = config.get("active_accid")
-    out_channel = config.get("out_channel", {})
-    chat_id = out_channel.get("chat_id")
-    channel_name = out_channel.get("name", "DeltaBot")
+    channels_to_mirror = config.get("channels_to_mirror", [])
+    
+    # Legacy support
+    if not channels_to_mirror and "out_channel" in config:
+        channels_to_mirror = [config["out_channel"]]
+        # also need to add tgid/username if missing, but it might be hard here
+    
+    channel_ids = [c.get("chat_id") for c in channels_to_mirror if c.get("chat_id")]
+    
     db_path = "data/db.sqlite"
     msg_repo = MessageRepository(db_path)
 
@@ -154,27 +155,27 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
     history_enabled = history_config.get("enabled", False)
     history_limit = history_config.get("limit", 10)
 
-    last_resend_time = 0
+    last_resend_times = {} # chat_id -> timestamp
     cooldown = 10 # seconds
 
     @hooks.on(events.RawEvent)
     def log_membership(bot, accid, event):
-        nonlocal last_resend_time
+        nonlocal last_resend_times
         kind = event.get("kind")
         if kind in ("SecureJoinInvite", "SecureJoinQrScanSuccess", "MemberAdded", "ChatlistItemChanged", "ContactChanged"):
             # Only log interesting events
             if kind != "ChatlistItemChanged":
-                logger.info(f"!!! EVENT: {kind} - {event}")
+                logger.debug(f"!!! EVENT: {kind} - {event}")
             
+            chat_id = event.get("chat_id")
             # History resend logic
-            # Trigger on MemberAdded OR ChatlistItemChanged (as joins often trigger list updates)
-            if history_enabled and kind in ("MemberAdded", "ChatlistItemChanged") and event.get("chat_id") == chat_id:
+            if history_enabled and kind in ("MemberAdded", "ChatlistItemChanged") and chat_id in channel_ids:
                 current_time = time.time()
                 # Use cooldown to prevent infinite loops (since resending history triggers ChatlistItemChanged)
-                if current_time - last_resend_time < cooldown:
+                if current_time - last_resend_times.get(chat_id, 0) < cooldown:
                     return
 
-                logger.info(f"Potential new member join detected ({kind}). Preparing history resend...")
+                logger.info(f"Potential new member join detected in chat {chat_id} ({kind}). Preparing history resend...")
                 
                 try:
                     # "Approve" the state - move from requests/noticed if needed
@@ -187,7 +188,7 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
                     if dc_msg_ids:
                         logger.info(f"Resending {len(dc_msg_ids)} messages to channel {chat_id}...")
                         bot.rpc.resend_messages(accid, dc_msg_ids)
-                        last_resend_time = current_time
+                        last_resend_times[chat_id] = current_time
                         logger.info("History resend complete.")
                 except Exception as e:
                     logger.error(f"Failed to handle history resend: {e}")
@@ -195,10 +196,9 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
     @hooks.on(events.NewMessage)
     def handle_msg(bot, accid, event):
         msg = event.msg
-        # Skip messages that are not in our broadcast channel
-        # This effectively ignores direct messages (DMs) to the bot
-        if msg.chat_id != chat_id:
-            logger.debug(f"Ignoring message in chat {msg.chat_id} (not our broadcast channel)")
+        # Skip messages that are not in our broadcast channels
+        if msg.chat_id not in channel_ids:
+            logger.debug(f"Ignoring message in chat {msg.chat_id} (not a broadcast channel)")
             return
 
         msg_type = "System" if msg.is_system else "Text"
@@ -211,12 +211,7 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
 
     acc_to_run = active_accid if active_accid in accounts else accounts[0]
     
-    try:
-        rpc.set_config(acc_to_run, "displayname", channel_name)
-    except:
-        pass
-
-    logger.info(f"Starting bot for account: {acc_to_run} (Channel ID: {chat_id})")
+    logger.info(f"Starting bot for account: {acc_to_run} (Listening on {len(channel_ids)} channels)")
     
     # Start Telegram Bridge in a separate thread, sharing the same RPC instance
     t_thread = Thread(target=start_telegram_bridge, args=(config, rpc, msg_repo), daemon=True)
@@ -224,12 +219,14 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
 
     bot = Bot(rpc, hooks, logger)
     
-    if chat_id and out_channel.get("send_start", False):
-        try:
-            logger.info(f"Sending 'start' message to channel {chat_id} to promote it...")
-            bot.rpc.send_msg(acc_to_run, chat_id, MsgData(text="start"))
-        except Exception as e:
-            logger.warning(f"Could not send startup message: {e}")
+    for channel_cfg in channels_to_mirror:
+        chat_id = channel_cfg.get("chat_id")
+        if chat_id and channel_cfg.get("send_start", False):
+            try:
+                logger.info(f"Sending 'start' message to channel {chat_id}...")
+                bot.rpc.send_msg(acc_to_run, chat_id, MsgData(text="start"))
+            except Exception as e:
+                logger.warning(f"Could not send startup message for {chat_id}: {e}")
 
     bot.run_forever(acc_to_run)
 
@@ -269,41 +266,61 @@ def main():
                 bot = Bot(rpc, hooks, logger)
                 config = load_config()
                 
+                channels_to_mirror = config.get("channels_to_mirror", [])
+                if not channels_to_mirror and "out_channel" in config:
+                    channels_to_mirror = [config["out_channel"]]
+                
                 accounts_config = config.get("accounts", [])
-                if accounts_config and "server" in accounts_config[0]:
-                    addr = f"dcaccount:{accounts_config[0]['server'].rstrip('/')}/new"
-                else:
-                    addr = "dcaccount:https://nine.testrun.org/new"
                 
-                logger.info(f"Initializing account with address: {addr}")
+                # Use existing account if configured and available
+                accid = None
+                if accounts_config:
+                    first_acc = accounts_config[0]
+                    if first_acc.get("use_if_exists") and first_acc.get("accid"):
+                        existing_accounts = rpc.get_all_account_ids()
+                        if first_acc["accid"] in existing_accounts:
+                            accid = first_acc["accid"]
+                            logger.info(f"Using existing account {accid}")
                 
-                # 1. Initialize DC Account
-                accid = init_account(bot, addr)
+                if not accid:
+                    if accounts_config and "server" in accounts_config[0]:
+                        addr = f"dcaccount:{accounts_config[0]['server'].rstrip('/')}/new"
+                    else:
+                        addr = "dcaccount:https://nine.testrun.org/new"
+                    
+                    logger.info(f"Initializing new account with address: {addr}")
+                    accid = init_account(bot, addr)
+                    
+                    if not accounts_config:
+                        config["accounts"] = [{"accid": accid, "server": "https://nine.testrun.org", "use_if_exists": True}]
+                    else:
+                        config["accounts"][0]["accid"] = accid
+                        config["accounts"][0]["use_if_exists"] = True
+                
                 config["active_accid"] = accid
                 
-                # Update accounts list in config if it was empty or different
-                if not accounts_config:
-                    config["accounts"] = [{"accid": accid, "server": "https://nine.testrun.org"}]
-                else:
-                    config["accounts"][0]["accid"] = accid
+                # 2. Setup DC Channels
+                for channel_cfg in channels_to_mirror:
+                    setup_channel(bot, accid, channel_cfg)
                 
                 save_config(config)
-                
-                # 2. Setup DC Channel
-                chat_id = setup_channel(bot, accid)
                 
                 # 3. Initialize Telegram Session
                 init_telegram_session(config)
                 
-                # 4. Sync name/photo if auto
-                if config.get("out_channel", {}).get("channel_photo_mode") == "auto":
-                    sync_tg_info_to_dc(config, rpc)
+                # 4. Sync name/photo for each channel if auto
+                sync_tg_info_to_dc(config, rpc)
                 
-                # 5. Show Link
-                qrdata = rpc.get_chat_securejoin_qr_code(accid, chat_id)
+                # 5. Show links
                 print(f"\nSUCCESS! Delta Chat Telegram Bridge is configured.")
-                print(f"Broadcast Channel link for Account #{accid}:")
-                print(qrdata)
+                for channel_cfg in channels_to_mirror:
+                    chat_id = channel_cfg.get("chat_id")
+                    if chat_id:
+                        qrdata = rpc.get_chat_securejoin_qr_code(accid, chat_id)
+                        name = channel_cfg.get("name", channel_cfg.get("username", "Unknown"))
+                        print(f"\nBroadcast Channel link for '{name}' (Account #{accid}):")
+                        print(qrdata)
+                
                 print(f"\nYou can now run the bot with: uv run python app/main.py --run")
             
             elif args.link:
@@ -320,10 +337,17 @@ def main():
                     accid = accounts[0]
                 
                 if rpc.is_configured(accid):
-                    chat_id = setup_channel(bot, accid)
-                    qrdata = rpc.get_chat_securejoin_qr_code(accid, chat_id)
-                    print(f"\nBroadcast Channel link for Account #{accid}:")
-                    print(qrdata)
+                    channels_to_mirror = config.get("channels_to_mirror", [])
+                    if not channels_to_mirror and "out_channel" in config:
+                        channels_to_mirror = [config["out_channel"]]
+                        
+                    for channel_cfg in channels_to_mirror:
+                        chat_id = setup_channel(bot, accid, channel_cfg)
+                        qrdata = rpc.get_chat_securejoin_qr_code(accid, chat_id)
+                        name = channel_cfg.get("name", channel_cfg.get("username", "Unknown"))
+                        print(f"\nBroadcast Channel link for '{name}' (Account #{accid}):")
+                        print(qrdata)
+                    save_config(config)
                 else:
                     logger.error(f"Account #{accid} not configured.")
             
@@ -334,6 +358,8 @@ def main():
                 parser.print_help()
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":

@@ -6,10 +6,11 @@ def init_db(db_path: str):
     with sqlite3.connect(db_path) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS channels (
-                accid INTEGER PRIMARY KEY,
+                accid INTEGER,
                 chat_id INTEGER,
                 name TEXT,
-                link TEXT
+                link TEXT,
+                PRIMARY KEY (accid, chat_id)
             )
         """)
         # Added dc_msg_id to store Delta Chat database ID

@@ -2,7 +2,7 @@ import asyncio
 import os
 import logging
 from pathlib import Path
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ReadMentionsRequest
 from deltachat2 import MsgData, Rpc
@@ -28,6 +28,10 @@ class TelegramBridge:
         self.app_version = t_config.get('app_version')
         self.lang_code = t_config.get('lang_code', 'en')
         self.system_lang_code = t_config.get('system_lang_code', 'en')
+        
+        self.channels_to_mirror = config.get("channels_to_mirror", [])
+        if not self.channels_to_mirror and "out_channel" in config:
+            self.channels_to_mirror = [config["out_channel"]]
 
     async def run(self):
         if not self.api_id or not self.api_hash:
@@ -48,41 +52,59 @@ class TelegramBridge:
         
         await self.client.start(phone=self.phone)
         
-        in_channel = self.config.get('in_channel', {})
-        bridge_channel = in_channel.get('bridge_channel')
-        bridge_channel_id = in_channel.get('bridge_channel_id')
-        
-        try:
-            target_chat = int(bridge_channel_id)
-        except (ValueError, TypeError):
-            target_chat = bridge_channel
-
-        if bridge_channel:
-            try:
-                logger.info(f"Ensuring member of Telegram channel: {bridge_channel}")
-                await self.client(JoinChannelRequest(bridge_channel))
-            except Exception as e:
-                logger.warning(f"Note on joining Telegram channel: {e}")
-
         accid = self.config.get('active_accid')
-        out_channel_config = self.config.get('out_channel', {})
-        dc_chat_id = out_channel_config.get('chat_id')
-        photo_mode = out_channel_config.get('channel_photo_mode', 'manual')
-
-        if not dc_chat_id:
-            logger.error("No Delta Chat channel ID found in config. Run --link first.")
-            return
-
-        if photo_mode == 'auto':
-            await self.sync_channel_info(target_chat, dc_chat_id, accid)
         
-        await self.start_listening(target_chat, dc_chat_id, accid)
+        tg_to_dc_map = {}
+        target_chats = []
 
-    async def sync_channel_info(self, target_chat, dc_chat_id, accid):
+        for channel_cfg in self.channels_to_mirror:
+            tgid = channel_cfg.get('tgid')
+            username = channel_cfg.get('username')
+            dc_chat_id = channel_cfg.get('chat_id')
+            photo_mode = channel_cfg.get('channel_photo_mode', 'manual')
+            
+            target_chat = None
+            if tgid:
+                try:
+                    target_chat = int(tgid)
+                except:
+                    pass
+            if not target_chat:
+                target_chat = username
+            
+            if not target_chat:
+                logger.warning(f"No tgid or username for channel config: {channel_cfg}")
+                continue
+
+            # Ensure member
+            try:
+                logger.info(f"Ensuring member of Telegram channel: {target_chat}")
+                await self.client(JoinChannelRequest(target_chat))
+            except Exception as e:
+                logger.warning(f"Note on joining Telegram channel {target_chat}: {e}")
+
+            # Get actual ID if it was a username
+            try:
+                entity = await self.client.get_entity(target_chat)
+                actual_tg_id = utils.get_peer_id(entity)
+                tg_to_dc_map[actual_tg_id] = dc_chat_id
+                target_chats.append(actual_tg_id)
+                
+                if photo_mode == 'auto':
+                    await self.sync_channel_info(entity, dc_chat_id, accid)
+            except Exception as e:
+                logger.error(f"Could not resolve entity for {target_chat}: {e}")
+
+        if not target_chats:
+            logger.error("No valid Telegram channels to mirror.")
+            return
+            
+        await self.start_listening(target_chats, tg_to_dc_map, accid)
+
+    async def sync_channel_info(self, entity, dc_chat_id, accid):
         try:
-            logger.info(f"Checking for channel info updates from Telegram: {target_chat}")
-            entity = await self.client.get_entity(target_chat)
             tg_name = getattr(entity, 'title', None)
+            logger.info(f"Checking for channel info updates from Telegram: {tg_name or entity.id}")
             
             # Get current DC chat info
             dc_chat = self.rpc.get_basic_chat_info(accid, dc_chat_id)
@@ -92,60 +114,41 @@ class TelegramBridge:
             if tg_name and tg_name != dc_name:
                 logger.info(f"Updating Delta Chat channel name: {dc_name} -> {tg_name}")
                 self.rpc.set_chat_name(accid, dc_chat_id, tg_name)
-            else:
-                logger.debug("Channel name is already up to date.")
-            
-            # Sync account display name
-            if tg_name:
-                try:
-                    logger.info(f"Setting Delta Chat account display name to: {tg_name}")
-                    self.rpc.set_config(accid, "displayname", tg_name)
-                except Exception as e:
-                    logger.warning(f"Could not set account display name: {e}")
             
             # Update avatar if different
             if entity.photo:
                 try:
-                    avatar_path = await self.client.download_profile_photo(entity, file="data/tg_avatar.png")
+                    avatar_path = await self.client.download_profile_photo(entity, file=f"data/tg_avatar_{entity.id}.png")
                     if avatar_path:
-                        logger.info(f"Synchronizing Delta Chat channel avatar from Telegram")
+                        logger.info(f"Synchronizing Delta Chat channel avatar from Telegram for {tg_name}")
                         self.rpc.set_chat_profile_image(accid, dc_chat_id, str(Path(avatar_path).absolute()))
-                        
-                        # ALSO sync account profile
-                        logger.info(f"Synchronizing Delta Chat account profile image from Telegram")
-                        abs_path = str(Path(avatar_path).absolute())
-                        # Try both ways to be sure
-                        self.rpc.set_config(accid, "selfavatar", abs_path)
-                        try:
-                            # Contact ID 1 is always the self-contact
-                            self.rpc.set_contact_profile_image(accid, 1, abs_path)
-                        except:
-                            pass
                 except Exception as e:
                     logger.warning(f"Could not sync avatar: {e}")
         except Exception as e:
             logger.warning(f"General error in sync_channel_info: {e}")
 
-    async def start_listening(self, target_chat, dc_chat_id, accid):
-        @self.client.on(events.ChatAction(chats=target_chat))
+    async def start_listening(self, target_chats, tg_to_dc_map, accid):
+        @self.client.on(events.ChatAction(chats=target_chats))
         async def chat_action_handler(event):
-            # Check config again to ensure we have latest photo_mode
-            current_out_config = self.config.get('out_channel', {})
-            current_photo_mode = current_out_config.get('channel_photo_mode', 'manual')
-            
-            if current_photo_mode != 'auto':
-                return
-
             if event.new_photo or event.new_title:
                 try:
-                    logger.info(f"Telegram channel update detected (photo/title change) for {target_chat}")
-                    await self.sync_channel_info(target_chat, dc_chat_id, accid)
+                    tg_id = event.chat_id
+                    dc_chat_id = tg_to_dc_map.get(tg_id)
+                    if dc_chat_id:
+                        logger.info(f"Telegram channel update detected (photo/title change) for {tg_id}")
+                        entity = await event.get_chat()
+                        await self.sync_channel_info(entity, dc_chat_id, accid)
                 except Exception as e:
                     logger.error(f"Error handling real-time Telegram update: {e}")
 
-        @self.client.on(events.NewMessage(chats=target_chat))
+        @self.client.on(events.NewMessage(chats=target_chats))
         async def handler(event):
             try:
+                tg_id = event.chat_id
+                dc_chat_id = tg_to_dc_map.get(tg_id)
+                if not dc_chat_id:
+                    return
+
                 await self.client.send_read_acknowledge(event.chat_id, event.message)
                 
                 text = event.message.message
@@ -160,7 +163,7 @@ class TelegramBridge:
                     media_path = await event.message.download_media(file=str(self.media_dir))
                 
                 if text or media_path:
-                    logger.info(f"Relaying from Telegram: {text[:30] if text else '[Media]'}...")
+                    logger.info(f"Relaying from Telegram {tg_id} to DC {dc_chat_id}: {text[:30] if text else '[Media]'}...")
                     
                     dc_msg_id = None
                     try:
@@ -184,17 +187,10 @@ class TelegramBridge:
             except Exception as e:
                 logger.error(f"Error in Telegram handler: {e}")
 
-        logger.info(f"Telegram bridge is listening on {target_chat}...")
+        logger.info(f"Telegram bridge is listening on {len(target_chats)} channels...")
         await self.client.run_until_disconnected()
 
 def start_telegram_bridge(config, rpc, msg_repo=None):
-    t_config = config.get('telegram', {})
-    api_id = t_config.get('api_id')
-    api_hash = t_config.get('api_hash')
-    phone = t_config.get('phone')
-    
-    # Use the shared RPC instance. deltachat2 RPC is thread-safe as it uses
-    # separate request IDs and a dedicated reader thread for responses.
     bridge = TelegramBridge(config, rpc, msg_repo)
     asyncio.run(bridge.run())
 
@@ -229,23 +225,10 @@ def init_telegram_session(config):
 
 async def sync_tg_info_to_dc_async(config, rpc):
     t_config = config.get('telegram', {})
-    in_channel = config.get('in_channel', {})
-    out_channel = config.get('out_channel', {})
-    
     api_id = t_config.get('api_id')
     api_hash = t_config.get('api_hash')
     
-    bridge_channel_id = in_channel.get('bridge_channel_id')
-    bridge_channel = in_channel.get('bridge_channel')
-    try:
-        target_chat = int(bridge_channel_id)
-    except (ValueError, TypeError):
-        target_chat = bridge_channel
-
-    dc_chat_id = out_channel.get('chat_id')
-    accid = config.get('active_accid')
-    
-    if not all([api_id, api_hash, target_chat, dc_chat_id, accid]):
+    if not api_id or not api_hash:
         return
 
     async with TelegramClient(
@@ -260,7 +243,25 @@ async def sync_tg_info_to_dc_async(config, rpc):
     ) as client:
         bridge = TelegramBridge(config, rpc)
         bridge.client = client
-        await bridge.sync_channel_info(target_chat, dc_chat_id, accid)
+        
+        accid = config.get('active_accid')
+        for channel_cfg in bridge.channels_to_mirror:
+            if channel_cfg.get('channel_photo_mode') != 'auto':
+                continue
+                
+            tgid = channel_cfg.get('tgid')
+            username = channel_cfg.get('username')
+            dc_chat_id = channel_cfg.get('chat_id')
+            
+            target_chat = tgid or username
+            if not target_chat or not dc_chat_id:
+                continue
+                
+            try:
+                entity = await client.get_entity(target_chat)
+                await bridge.sync_channel_info(entity, dc_chat_id, accid)
+            except Exception as e:
+                logger.warning(f"Could not sync info for {target_chat}: {e}")
 
 def sync_tg_info_to_dc(config, rpc):
     asyncio.run(sync_tg_info_to_dc_async(config, rpc))

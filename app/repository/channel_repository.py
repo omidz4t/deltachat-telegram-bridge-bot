@@ -19,13 +19,13 @@ class ChannelRepository:
                 )
             """)
 
-    def get_by_accid(self, accid: int) -> Optional[Channel]:
+    def get_by_accid(self, accid: int) -> list[Channel]:
+        channels = []
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute("SELECT accid, chat_id, name, link FROM channels WHERE accid = ?", (accid,))
-            row = cur.fetchone()
-            if row:
-                return Channel(accid=row[0], chat_id=row[1], name=row[2], link=row[3])
-        return None
+            for row in cur.fetchall():
+                channels.append(Channel(accid=row[0], chat_id=row[1], name=row[2], link=row[3]))
+        return channels
 
     def save(self, channel: Channel):
         with sqlite3.connect(self.db_path) as conn:

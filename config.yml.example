@@ -1,19 +1,26 @@
 accounts:
 - accid: 1
   server: https://nine.testrun.org
-active_accid: 1
-history_resend:
-  enabled: true
-  limit: 10
-in_channel:
-  bridge_channel: https://t.me/your_telegram_channel
-  bridge_channel_id: -1001234567890
-out_channel:
-  avatar: assets/avatar.png
-  channel_photo_mode: auto
-  chat_id: 10
-  name: Your Delta Chat Channel
-  send_start: false
+  use_if_exists: true
+
+
+channels_to_mirror:
+  - tgid: -1001234567890
+    username: your_telegram_channel
+    channel_photo_mode: auto
+    delta_chat_account: 1
+    delta_chat_chat_id: 10
+    send_start: false
+    chat_id: 10
+  - tgid: -1001234567891
+    username: your_another_telegram_channel
+    channel_photo_mode: auto
+    delta_chat_account: 1
+    delta_chat_chat_id: 11
+    send_start: false
+    chat_id: 11
+
+
 telegram:
   api_hash: your_api_hash
   api_id: your_api_id
