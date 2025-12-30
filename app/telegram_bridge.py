@@ -189,14 +189,34 @@ class TelegramBridge:
                         text = f"{video_prefix} {text}" if text else video_prefix
                 
                 if text or media_path:
-                    logger.info(f"Relaying from Telegram {tg_id} to DC {dc_chat_id}: {text[:30] if text else '[Media]'}...")
+                    sender = await event.get_sender()
+                    sender_name = utils.get_display_name(sender) if sender else None
+                    
+                    # Handle replies/quotes
+                    quoted_message_id = None
+                    reply_to_msg_id = event.message.reply_to_msg_id
+                    if reply_to_msg_id and self.msg_repo:
+                        quoted_msg = self.msg_repo.get_by_telegram_id(reply_to_msg_id)
+                        if quoted_msg:
+                            quoted_message_id = quoted_msg.dc_msg_id
+                    
+                    logger.info(f"Relaying from Telegram {tg_id} ({sender_name}) to DC {dc_chat_id}: {text[:30] if text else '[Media]'}...")
                     
                     dc_msg_id = None
                     try:
                         if media_path:
-                            dc_msg_id = self.rpc.send_msg(accid, dc_chat_id, MsgData(text=text, file=str(Path(media_path).absolute())))
+                            dc_msg_id = self.rpc.send_msg(accid, dc_chat_id, MsgData(
+                                text=text, 
+                                file=str(Path(media_path).absolute()), 
+                                override_sender_name=sender_name,
+                                quoted_message_id=quoted_message_id
+                            ))
                         else:
-                            dc_msg_id = self.rpc.send_msg(accid, dc_chat_id, MsgData(text=text))
+                            dc_msg_id = self.rpc.send_msg(accid, dc_chat_id, MsgData(
+                                text=text, 
+                                override_sender_name=sender_name,
+                                quoted_message_id=quoted_message_id
+                            ))
                     except Exception as e:
                         logger.error(f"Failed to relay message to Delta Chat: {e}")
 

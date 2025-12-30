@@ -1,5 +1,5 @@
 import sqlite3
-from typing import List
+from typing import List, Optional
 from models.message import Message
 
 class MessageRepository:
@@ -35,3 +35,23 @@ class MessageRepository:
                 ))
             messages.reverse()
             return messages
+
+    def get_by_telegram_id(self, telegram_msg_id: int) -> Optional[Message]:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("""
+                SELECT telegram_msg_id, dc_msg_id, text, media_path, media_type, id
+                FROM messages
+                WHERE telegram_msg_id = ?
+                LIMIT 1
+            """, (telegram_msg_id,))
+            row = cur.fetchone()
+            if row:
+                return Message(
+                    telegram_msg_id=row[0],
+                    dc_msg_id=row[1],
+                    text=row[2],
+                    media_path=row[3],
+                    media_type=row[4],
+                    id=row[5]
+                )
+            return None
