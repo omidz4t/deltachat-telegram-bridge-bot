@@ -12,9 +12,21 @@ channels_to_mirror:
     delta_chat_chat_id: 10
     send_start: false
     chat_id: 10
+    photo:
+      enable: true
+      message: "[Photo]"
+    video:
+      enable: true
+      message: "[Video]"
   - username: your_another_telegram_channel_alternative_join_with_username_on_init
     delta_chat_account: 1
     delta_chat_chat_id: 11
+    photo:
+      enable: false
+      message: "[این پیام شامل عکس هست]"
+    video:
+      enable: false
+      message: "[این پیام شامل ویدیو هست]"
   
 
 

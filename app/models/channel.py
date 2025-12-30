@@ -7,3 +7,7 @@ class Channel:
     chat_id: int
     name: str
     link: Optional[str] = None
+    photo_enabled: bool = True
+    photo_message: str = "[Photo]"
+    video_enabled: bool = True
+    video_message: str = "[Video]"

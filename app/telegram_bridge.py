@@ -102,7 +102,7 @@ class TelegramBridge:
             dc_chat_id = channel_cfg.get('chat_id')
             actual_tg_id = await self._resolve_and_join_channel(channel_cfg, accid)
             if actual_tg_id:
-                tg_to_dc_map[actual_tg_id] = dc_chat_id
+                tg_to_dc_map[actual_tg_id] = channel_cfg
                 target_chats.append(actual_tg_id)
 
         if not target_chats:
@@ -143,8 +143,9 @@ class TelegramBridge:
             if event.new_photo or event.new_title:
                 try:
                     tg_id = event.chat_id
-                    dc_chat_id = tg_to_dc_map.get(tg_id)
-                    if dc_chat_id:
+                    channel_cfg = tg_to_dc_map.get(tg_id)
+                    if channel_cfg:
+                        dc_chat_id = channel_cfg.get('chat_id')
                         logger.info(f"Telegram channel update detected (photo/title change) for {tg_id}")
                         entity = await event.get_chat()
                         await self.sync_channel_info(entity, dc_chat_id, accid)
@@ -155,9 +156,18 @@ class TelegramBridge:
         async def handler(event):
             try:
                 tg_id = event.chat_id
-                dc_chat_id = tg_to_dc_map.get(tg_id)
-                if not dc_chat_id:
+                channel_cfg = tg_to_dc_map.get(tg_id)
+                if not channel_cfg:
                     return
+                dc_chat_id = channel_cfg.get('chat_id')
+                
+                photo_cfg = channel_cfg.get('photo', {})
+                photo_enabled = photo_cfg.get('enable', True)
+                photo_prefix = photo_cfg.get('message', '[Photo]')
+                
+                video_cfg = channel_cfg.get('video', {})
+                video_enabled = video_cfg.get('enable', True)
+                video_prefix = video_cfg.get('message', '[Video]')
 
                 await self.client.send_read_acknowledge(event.chat_id, event.message)
                 
@@ -167,10 +177,16 @@ class TelegramBridge:
                 
                 if event.message.photo:
                     media_type = "image"
-                    media_path = await event.message.download_media(file=str(self.media_dir))
+                    if photo_enabled:
+                        media_path = await event.message.download_media(file=str(self.media_dir))
+                    else:
+                        text = f"{photo_prefix} {text}" if text else photo_prefix
                 elif event.message.video:
                     media_type = "video"
-                    media_path = await event.message.download_media(file=str(self.media_dir))
+                    if video_enabled:
+                        media_path = await event.message.download_media(file=str(self.media_dir))
+                    else:
+                        text = f"{video_prefix} {text}" if text else video_prefix
                 
                 if text or media_path:
                     logger.info(f"Relaying from Telegram {tg_id} to DC {dc_chat_id}: {text[:30] if text else '[Media]'}...")

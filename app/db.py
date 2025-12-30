@@ -10,6 +10,10 @@ def init_db(db_path: str):
                 chat_id INTEGER,
                 name TEXT,
                 link TEXT,
+                photo_enabled INTEGER DEFAULT 1,
+                photo_message TEXT DEFAULT '[Photo]',
+                video_enabled INTEGER DEFAULT 1,
+                video_message TEXT DEFAULT '[Video]',
                 PRIMARY KEY (accid, chat_id)
             )
         """)
@@ -31,3 +35,21 @@ def init_db(db_path: str):
             conn.execute("ALTER TABLE messages ADD COLUMN dc_msg_id INTEGER")
         except sqlite3.OperationalError:
             pass # already exists
+
+        # Migration: if photo_enabled doesn't exist, add its set
+        try:
+            conn.execute("ALTER TABLE channels ADD COLUMN photo_enabled INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE channels ADD COLUMN photo_message TEXT DEFAULT '[Photo]'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE channels ADD COLUMN video_enabled INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE channels ADD COLUMN video_message TEXT DEFAULT '[Video]'")
+        except sqlite3.OperationalError:
+            pass

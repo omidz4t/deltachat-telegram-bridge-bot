@@ -258,6 +258,7 @@ def main():
                 if not channels_to_mirror and "out_channel" in config:
                     channels_to_mirror = [config["out_channel"]]
                 
+                channel_repo = ChannelRepository(db_path)
                 accounts_config = config.get("accounts", [])
                 
                 # Use existing account if configured and available
@@ -289,7 +290,18 @@ def main():
                 
                 # 2. Setup DC Channels
                 for channel_cfg in channels_to_mirror:
-                    setup_channel(bot, accid, channel_cfg)
+                    chat_id = setup_channel(bot, accid, channel_cfg)
+                    photo_cfg = channel_cfg.get("photo", {})
+                    video_cfg = channel_cfg.get("video", {})
+                    channel_repo.save(Channel(
+                        accid=accid,
+                        chat_id=chat_id,
+                        name=channel_cfg.get("name", channel_cfg.get("username", "Unknown")),
+                        photo_enabled=photo_cfg.get("enable", True),
+                        photo_message=photo_cfg.get("message", "[Photo]"),
+                        video_enabled=video_cfg.get("enable", True),
+                        video_message=video_cfg.get("message", "[Video]")
+                    ))
                 
                 save_config(config)
                 
@@ -328,9 +340,21 @@ def main():
                     channels_to_mirror = config.get("channels_to_mirror", [])
                     if not channels_to_mirror and "out_channel" in config:
                         channels_to_mirror = [config["out_channel"]]
-                        
+                    
+                    channel_repo = ChannelRepository(db_path)
                     for channel_cfg in channels_to_mirror:
                         chat_id = setup_channel(bot, accid, channel_cfg)
+                        photo_cfg = channel_cfg.get("photo", {})
+                        video_cfg = channel_cfg.get("video", {})
+                        channel_repo.save(Channel(
+                            accid=accid,
+                            chat_id=chat_id,
+                            name=channel_cfg.get("name", channel_cfg.get("username", "Unknown")),
+                            photo_enabled=photo_cfg.get("enable", True),
+                            photo_message=photo_cfg.get("message", "[Photo]"),
+                            video_enabled=video_cfg.get("enable", True),
+                            video_message=video_cfg.get("message", "[Video]")
+                        ))
                         qrdata = rpc.get_chat_securejoin_qr_code(accid, chat_id)
                         name = channel_cfg.get("name", channel_cfg.get("username", "Unknown"))
                         print(f"\nBroadcast Channel link for '{name}' (Account #{accid}):")
