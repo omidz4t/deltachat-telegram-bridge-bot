@@ -1,0 +1,22 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[oc]
+.venv/
+.python-version
+
+# Data and Config
+data/
+config.yml
+*.sqlite
+
+# UV
+.uv
+
+# Build
+build/
+dist/
+*.egg-info
