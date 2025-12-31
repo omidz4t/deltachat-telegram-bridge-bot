@@ -22,6 +22,47 @@ from telegram_bridge import start_telegram_bridge, init_telegram_session, sync_t
 
 from config_utils import load_config, save_config
 
+def apply_dc_proxy_config(rpc: Rpc, accid: int, proxy_cfg: Optional[dict]):
+    if not proxy_cfg:
+        rpc.set_config(accid, "proxy_enabled", "0")
+        return
+
+    logger.info(f"Applying proxy configuration for account {accid}...")
+    
+    proxy_type = str(proxy_cfg.get("type", "http")).lower()
+    host = proxy_cfg.get("host", "")
+    port = proxy_cfg.get("port", "")
+    username = proxy_cfg.get("username", "")
+    password = proxy_cfg.get("password", "")
+    
+    if host:
+        auth = ""
+        if username:
+            auth = f"{username}"
+            if password:
+                auth += f":{password}"
+            auth += "@"
+        
+        url = f"{proxy_type}://{auth}{host}"
+        if port:
+            url += f":{port}"
+            
+        try:
+            rpc.set_config(accid, "proxy_url", url)
+            rpc.set_config(accid, "proxy_enabled", "1")
+            logger.info(f"Proxy set to: {proxy_type}://{host}:{port}")
+        except Exception as e:
+            logger.error(f"Failed to set proxy_url: {e}")
+            # Fallback to socks5 keys if it's socks5 and proxy_url failed (unlikely given test results)
+            if proxy_type == "socks5":
+                rpc.set_config(accid, "socks5_enabled", "1")
+                rpc.set_config(accid, "socks5_host", host)
+                rpc.set_config(accid, "socks5_port", str(port))
+                if username: rpc.set_config(accid, "socks5_user", username)
+                if password: rpc.set_config(accid, "socks5_password", password)
+    else:
+        rpc.set_config(accid, "proxy_enabled", "0")
+
 def process_init_events(bot: Bot):
     events_to_log = (EventType.INFO, EventType.WARNING, EventType.ERROR)
     last_progress = -1
@@ -54,8 +95,10 @@ def process_init_events(bot: Bot):
             logger.error(f"Error in event processing: {e}")
             break
 
-def init_account(bot: Bot, addr: str):
+def init_account(bot: Bot, addr: str, proxy_cfg: dict = None):
     accid = bot.rpc.add_account()
+    if proxy_cfg:
+        apply_dc_proxy_config(bot.rpc, accid, proxy_cfg)
     logger.info(f"Starting configuration process for account {accid}...")
     bot.rpc.set_config(accid, "bot", "1")
     
@@ -128,6 +171,7 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
     config = load_config()
     active_accid = config.get("active_accid")
     channels_to_mirror = config.get("channels_to_mirror", [])
+    accounts_config = config.get("accounts", [])
     
     # Legacy support
     if not channels_to_mirror and "out_channel" in config:
@@ -142,34 +186,48 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
     history_config = config.get("history_resend", {})
     history_enabled = history_config.get("enabled", False)
     history_limit = history_config.get("limit", 10)
+    logger.info(f"History resend: {'enabled' if history_enabled else 'disabled'} (limit: {history_limit})")
 
     last_resend_times = {} # chat_id -> timestamp
     cooldown = 10 # seconds
 
     @hooks.on(events.RawEvent)
-    def log_membership(bot, accid, event):
+    def log_events(bot, accid, event):
         nonlocal last_resend_times
         kind = event.get("kind")
-        if kind in ("SecureJoinInvite", "SecureJoinQrScanSuccess", "MemberAdded", "ChatlistItemChanged", "ContactChanged"):
-            # Only log interesting events
-            if kind != "ChatlistItemChanged":
-                logger.debug(f"!!! EVENT: {kind} - {event}")
-            
-            chat_id = event.get("chat_id")
+        chat_id = event.get("chat_id")
+        
+        if not chat_id or chat_id not in channel_ids:
+            return
+
+        logger.info(f"Channel {chat_id} has new event: {kind}")
+
+        # Events that indicate a new member or a potential need for history resend
+        join_events = ("MemberAdded", "SecurejoinInviterProgress", "SecureJoinQrScanSuccess", "ChatModified")
+        
+        if kind in join_events:
+            # For SecurejoinInviterProgress, only trigger when it reaches 100%
+            if kind == "SecurejoinInviterProgress" and event.get("progress") != 1000:
+                return
+
+            try:
+                # Always "Accept" the chat to ensure it's in the Normal list (especially if it was a Request)
+                # This covers the "accept it always" requirement.
+                bot.rpc.accept_chat(accid, chat_id)
+                bot.rpc.marknoticed_chat(accid, chat_id)
+            except Exception as e:
+                logger.debug(f"Could not accept/mark noticed chat {chat_id}: {e}")
+
             # History resend logic
-            if history_enabled and kind in ("MemberAdded", "ChatlistItemChanged") and chat_id in channel_ids:
+            if history_enabled:
                 current_time = time.time()
-                # Use cooldown to prevent infinite loops (since resending history triggers ChatlistItemChanged)
+                # Use cooldown to prevent infinite loops and spamming the channel
                 if current_time - last_resend_times.get(chat_id, 0) < cooldown:
                     return
 
-                logger.info(f"Potential new member join detected in chat {chat_id} ({kind}). Preparing history resend...")
+                logger.info(f"Join/Modified event detected in chat {chat_id} ({kind}). Preparing history resend...")
                 
                 try:
-                    # "Approve" the state - move from requests/noticed if needed
-                    bot.rpc.accept_chat(accid, chat_id)
-                    bot.rpc.marknoticed_chat(accid, chat_id)
-                    
                     latest_msgs = msg_repo.get_latest(history_limit)
                     dc_msg_ids = [m.dc_msg_id for m in latest_msgs if m.dc_msg_id]
                     
@@ -178,6 +236,8 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
                         bot.rpc.resend_messages(accid, dc_msg_ids)
                         last_resend_times[chat_id] = current_time
                         logger.info("History resend complete.")
+                    else:
+                        logger.warning(f"No messages found in database to resend for channel {chat_id}")
                 except Exception as e:
                     logger.error(f"Failed to handle history resend: {e}")
 
@@ -199,6 +259,15 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
 
     acc_to_run = active_accid if active_accid in accounts else accounts[0]
     
+    # Apply proxy if configured for this account
+    proxy_cfg = None
+    for acc in accounts_config:
+        if acc.get("accid") == acc_to_run:
+            proxy_cfg = acc.get("proxy")
+            break
+    if proxy_cfg:
+        apply_dc_proxy_config(rpc, acc_to_run, proxy_cfg)
+
     logger.info(f"Starting bot for account: {acc_to_run} (Listening on {len(channel_ids)} channels)")
     
     # Start Telegram Bridge in a separate thread, sharing the same RPC instance
@@ -270,15 +339,17 @@ def main():
                         if first_acc["accid"] in existing_accounts:
                             accid = first_acc["accid"]
                             logger.info(f"Using existing account {accid}")
+                            apply_dc_proxy_config(rpc, accid, first_acc.get("proxy"))
                 
                 if not accid:
+                    proxy_cfg = accounts_config[0].get("proxy") if accounts_config else None
                     if accounts_config and "server" in accounts_config[0]:
                         addr = f"dcaccount:{accounts_config[0]['server'].rstrip('/')}/new"
                     else:
                         addr = "dcaccount:https://nine.testrun.org/new"
                     
                     logger.info(f"Initializing new account with address: {addr}")
-                    accid = init_account(bot, addr)
+                    accid = init_account(bot, addr, proxy_cfg)
                     
                     if not accounts_config:
                         config["accounts"] = [{"accid": accid, "server": "https://nine.testrun.org", "use_if_exists": True}]
@@ -327,6 +398,7 @@ def main():
                 bot = Bot(rpc, hooks, logger)
                 config = load_config()
                 accid = config.get("active_accid")
+                accounts_config = config.get("accounts", [])
                 
                 accounts = rpc.get_all_account_ids()
                 if not accounts:
@@ -335,6 +407,15 @@ def main():
                 
                 if not accid or accid not in accounts:
                     accid = accounts[0]
+                
+                # Apply proxy if configured for this account
+                proxy_cfg = None
+                for acc in accounts_config:
+                    if acc.get("accid") == accid:
+                        proxy_cfg = acc.get("proxy")
+                        break
+                if proxy_cfg:
+                    apply_dc_proxy_config(rpc, accid, proxy_cfg)
                 
                 if rpc.is_configured(accid):
                     channels_to_mirror = config.get("channels_to_mirror", [])
