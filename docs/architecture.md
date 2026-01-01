@@ -9,6 +9,8 @@ The entry point of the application. It handles:
 - Coordinate initialization (`--init`).
 - Starting the Telegram Bridge thread.
 - Managing the Delta Chat event loop.
+- **Admin Authentication**: Validates users using the `admin_password`.
+- **Command Dispatcher**: Handles `/links` and `/add` commands for authenticated admins.
 - Handling join events (`MemberAdded`, `SecureJoinQrScanSuccess`) to trigger history resending.
 
 ### 2. Telegram Bridge (`app/telegram_bridge.py`)
@@ -28,6 +30,7 @@ This component runs in a separate thread and manages the `Telethon` client.
     - Preventing duplicate relays.
     - Resolving replies/quotes (mapping a Telegram reply to a Delta Chat quoted message).
     - Correctly identifying "last N" messages for history resend.
+- **`AdminRepository`**: Manages the list of authenticated administrator contact IDs.
 
 ### 5. Database (`app/db.py`)
 Initializes the SQLite database and handles schema migrations. Uses a unique constraint on `(dc_chat_id, telegram_msg_id)` to support multiple channels where Telegram IDs might collide.

@@ -13,6 +13,7 @@ from typing import Optional
 
 from deltachat2 import Bot, Rpc, IOTransport, EventType, CoreEvent, Event, MsgData, events, JsonRpcError
 from deltachat2.events import RawEvent, HookCollection
+from telethon import utils
 
 from logger import logger, setup_logging
 from repository.channel_repository import ChannelRepository
@@ -22,6 +23,7 @@ from db import init_db
 from telegram_bridge import start_telegram_bridge, init_telegram_session, sync_tg_info_to_dc
 
 from config_utils import load_config, save_config
+from repository.admin_repository import AdminRepository
 
 def apply_dc_proxy_config(rpc: Rpc, accid: int, proxy_cfg: Optional[dict]):
     if not proxy_cfg:
@@ -185,6 +187,9 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
     db_path = "data/db.sqlite"
     msg_repo = MessageRepository(db_path)
     chan_repo = ChannelRepository(db_path)
+    admin_repo = AdminRepository(db_path)
+
+    admin_password = config.get("admin_password")
 
     history_config = config.get("history_resend", {})
     history_enabled = history_config.get("enabled", False)
@@ -327,9 +332,298 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
     @hooks.on(events.NewMessage)
     def handle_msg(bot, accid, event):
         msg = event.msg
-        # Skip messages that are not in our broadcast channels
+        
+        # 1. Check if it's a command/password in a 1-on-1 chat or similar
+        # We can check if the chat is NOT one of the mirrored channels
         if msg.chat_id not in channel_ids:
-            logger.debug(f"Ignoring message in chat {msg.chat_id} (not a broadcast channel)")
+            text = msg.text.strip() if msg.text else ""
+            
+            # Check if it's the admin password
+            if admin_password and text == admin_password:
+                admin_repo.add_admin(msg.from_id)
+                bot.rpc.send_msg(accid, msg.chat_id, MsgData(text="Authentication successful! You are now an admin.\nCommands:\n/links - Get channel invite links\n/add CHANNEL_ID - Add a new channel to mirror"))
+                return
+
+            # Check if user is admin
+            if admin_repo.is_admin(msg.from_id):
+                if text == "/help":
+                    help_text = (
+                        "Available Admin Commands:\n\n"
+                        "/help - Show this help message\n"
+                        "/links - List all active mirrored channels with their DC Chat IDs and invite links\n"
+                        "/add CHANNEL_ID [NO_PHOTO] [NO_VIDEO] - Add a new Telegram channel to mirror. "
+                        "CHANNEL_ID can be a username (e.g., @channel) or a tgid (e.g., -100...)\n"
+                        "/link CHAT_ID [NO_PHOTO] [NO_VIDEO] - Update media settings for an existing channel. "
+                        "CHAT_ID is the Delta Chat ID from /links\n"
+                        "/photo CHAT_ID on|off - Enable or disable photo relaying for a channel\n"
+                        "/video CHAT_ID on|off - Enable or disable video relaying for a channel\n"
+                        "/delete CHAT_ID - Remove a channel from the mirror list and stop mirroring"
+                    )
+                    bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=help_text))
+                    return
+
+                if text == "/links":
+                    # Get all active channels and their links
+                    response = "Active Channels:\n"
+                    # Combine memory state to be sure we show everything currently being mirrored
+                    if not channel_ids:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text="No channels configured."))
+                        return
+
+                    for cid in channel_ids:
+                        cfg = chat_id_to_cfg.get(cid)
+                        chan = chan_repo.get_by_chat_id(accid, cid)
+                        name = (chan.name if chan else cfg.get("name")) or "Unknown"
+                        qrdata = bot.rpc.get_chat_securejoin_qr_code(accid, cid)
+                        
+                        status = []
+                        if chan:
+                            if not chan.photo_enabled: status.append("NO_PHOTO")
+                            if not chan.video_enabled: status.append("NO_VIDEO")
+                        elif cfg:
+                             if not cfg.get("photo", {}).get("enable", True): status.append("NO_PHOTO")
+                             if not cfg.get("video", {}).get("enable", True): status.append("NO_VIDEO")
+                        
+                        status_str = f" [{', '.join(status)}]" if status else ""
+                        response += f"- {name}\n  DC Chat ID: {cid}{status_str}\n  Link: {qrdata}\n"
+                    bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=response))
+                    return
+
+                elif text.startswith("/link"):
+                    parts = text.split()
+                    if len(parts) < 2:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text="Usage: /link CHAT_ID [NO_PHOTO] [NO_VIDEO]"))
+                        return
+                    
+                    target_id_str = parts[1]
+                    no_photo = "NO_PHOTO" in [p.upper() for p in parts]
+                    no_video = "NO_VIDEO" in [p.upper() for p in parts]
+                    
+                    try:
+                        target_id = int(target_id_str)
+                    except ValueError:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text="CHAT_ID must be a number."))
+                        return
+
+                    # Find channel in DB
+                    chan = chan_repo.get_by_chat_id(accid, target_id)
+                    if not chan:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Channel {target_id} not found. Use DC Chat ID from /links."))
+                        return
+                    
+                    # Update DB
+                    chan.photo_enabled = not no_photo
+                    chan.video_enabled = not no_video
+                    chan_repo.save(chan)
+                    
+                    # Update config.yml for persistence
+                    full_config = load_config()
+                    for c_cfg in full_config.get("channels_to_mirror", []):
+                        if c_cfg.get("chat_id") == chan.chat_id:
+                            if "photo" not in c_cfg: c_cfg["photo"] = {}
+                            if "video" not in c_cfg: c_cfg["video"] = {}
+                            c_cfg["photo"]["enable"] = not no_photo
+                            c_cfg["video"]["enable"] = not no_video
+                            break
+                    save_config(full_config)
+                    
+                    bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Settings updated for {chan.name}:\nPhoto: {'Enabled' if not no_photo else 'Disabled'}\nVideo: {'Enabled' if not no_video else 'Disabled'}"))
+                    return
+
+                elif text.startswith("/photo") or text.startswith("/video"):
+                    is_photo = text.startswith("/photo")
+                    parts = text.split()
+                    if len(parts) < 3:
+                        cmd = "/photo" if is_photo else "/video"
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Usage: {cmd} CHAT_ID on|off"))
+                        return
+                    
+                    target_id_str = parts[1]
+                    action = parts[2].lower()
+                    if action not in ["on", "off"]:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text="Action must be 'on' or 'off'."))
+                        return
+                    
+                    enable = (action == "on")
+                    
+                    try:
+                        target_id = int(target_id_str)
+                    except ValueError:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text="CHAT_ID must be a number."))
+                        return
+
+                    # Find channel in DB
+                    chan = chan_repo.get_by_chat_id(accid, target_id)
+                    if not chan:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Channel {target_id} not found in database."))
+                        return
+                    
+                    if is_photo:
+                        chan.photo_enabled = enable
+                    else:
+                        chan.video_enabled = enable
+                    
+                    chan_repo.save(chan)
+                    
+                    # Update config.yml for persistence
+                    full_config = load_config()
+                    for c_cfg in full_config.get("channels_to_mirror", []):
+                        if c_cfg.get("chat_id") == chan.chat_id:
+                            key = "photo" if is_photo else "video"
+                            if key not in c_cfg: c_cfg[key] = {}
+                            c_cfg[key]["enable"] = enable
+                            break
+                    save_config(full_config)
+                    
+                    media_type = "Photo" if is_photo else "Video"
+                    status = "enabled" if enable else "disabled"
+                    bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"{media_type} relaying {status} for channel {chan.name} (ID: {chan.chat_id})."))
+                    return
+
+                elif text.startswith("/delete"):
+                    parts = text.split()
+                    if len(parts) < 2:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text="Usage: /delete CHAT_ID"))
+                        return
+                    
+                    target_id = parts[1]
+                    try:
+                        target_id = int(target_id)
+                    except:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text="CHAT_ID must be a number."))
+                        return
+
+                    # 1. Update memory
+                    found = False
+                    if target_id in channel_ids:
+                        channel_ids.remove(target_id)
+                        found = True
+                    if target_id in chat_id_to_cfg:
+                        del chat_id_to_cfg[target_id]
+                        found = True
+                    
+                    if not found:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Channel {target_id} not found in current session."))
+                        return
+
+                    # 2. Update config.yml
+                    full_config = load_config()
+                    full_config["channels_to_mirror"] = [c for c in full_config.get("channels_to_mirror", []) if c.get("chat_id") != target_id]
+                    save_config(full_config)
+                    
+                    # 3. Update DB
+                    chan_repo.delete(accid, target_id)
+                    
+                    # 4. Update bridge
+                    bridge = bridge_container.get('bridge')
+                    if bridge and hasattr(bridge, 'remove_dynamic_channel'):
+                        asyncio.run_coroutine_threadsafe(bridge.remove_dynamic_channel(target_id), bridge.loop)
+                    
+                    bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Channel {target_id} deleted and mirroring stopped."))
+                    return
+
+                elif text.startswith("/add"):
+                    parts = text.split()
+                    if len(parts) < 2:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text="Usage: /add CHANNEL_ID [NO_PHOTO] [NO_VIDEO]"))
+                        return
+                    
+                    tg_target = parts[1]
+                    no_photo = "NO_PHOTO" in [p.upper() for p in parts]
+                    no_video = "NO_VIDEO" in [p.upper() for p in parts]
+
+                    bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Adding channel {tg_target}... Please wait."))
+                    
+                    bridge = bridge_container.get('bridge')
+                    if bridge and bridge.loop:
+                        async def do_add():
+                            try:
+                                # Resolve and Join TG entity via bridge helper
+                                try:
+                                    # Create a temporary config for resolution
+                                    tmp_cfg = {}
+                                    if "t.me/" in tg_target or "+" in tg_target:
+                                        tmp_cfg["username"] = tg_target
+                                    elif tg_target.startswith('-') or tg_target.isdigit():
+                                        tmp_cfg["tgid"] = tg_target
+                                    else:
+                                        tmp_cfg["username"] = tg_target
+
+                                    tg_id = await bridge._resolve_and_join_channel(tmp_cfg, accid)
+                                    if not tg_id:
+                                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Error: Could not resolve or join Telegram channel '{tg_target}'. Ensure the bot has access or the invite link is valid."))
+                                        return
+                                    
+                                    # Now get the details from the resolved entity
+                                    entity = await bridge.client.get_entity(tg_id)
+                                    tg_name = getattr(entity, 'title', 'New Channel')
+                                    tg_username = getattr(entity, 'username', None)
+                                except Exception as e:
+                                    bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Error resolving Telegram channel: {e}"))
+                                    return
+
+                                # Create DC Channel
+                                dc_chat_id = bot.rpc.create_broadcast(accid, tg_name)
+                                try:
+                                    bot.rpc.set_chat_visibility(accid, dc_chat_id, "Normal")
+                                except:
+                                    pass
+                                
+                                # Update config
+                                full_config = load_config()
+                                if "channels_to_mirror" not in full_config:
+                                    full_config["channels_to_mirror"] = []
+                                
+                                # Check if already exists (tgid or username)
+                                for c in full_config["channels_to_mirror"]:
+                                    if c.get("tgid") == tg_id or (tg_username and c.get("username") == tg_username):
+                                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Channel {tg_target} is already mirrored."))
+                                        return
+
+                                mirror_entry = {
+                                    "tgid": tg_id,
+                                    "username": tg_username or tg_target,
+                                    "chat_id": dc_chat_id,
+                                    "name": tg_name,
+                                    "photo": {"enable": not no_photo},
+                                    "video": {"enable": not no_video}
+                                }
+                                full_config["channels_to_mirror"].append(mirror_entry)
+                                save_config(full_config)
+                                
+                                # Update repository
+                                chan_repo.save(Channel(
+                                    accid=accid,
+                                    chat_id=dc_chat_id,
+                                    name=tg_name,
+                                    photo_enabled=not no_photo,
+                                    video_enabled=not no_video
+                                ))
+                                
+                                # Update local runtime state
+                                nonlocal channel_ids, chat_id_to_cfg
+                                channel_ids.append(dc_chat_id)
+                                chat_id_to_cfg[dc_chat_id] = mirror_entry
+                                
+                                # Tell bridge to sync and start listening
+                                if hasattr(bridge, 'add_dynamic_channel'):
+                                    await bridge.add_dynamic_channel(mirror_entry, accid)
+                                else:
+                                    await bridge._resolve_and_join_channel(mirror_entry, accid, sync_info_now=True)
+                                
+                                qrdata = bot.rpc.get_chat_securejoin_qr_code(accid, dc_chat_id)
+                                bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Success! Channel {tg_name} added.\nTG ID: {tg_id}\nDC Chat ID: {dc_chat_id}\nInvite Link:\n{qrdata}"))
+                                
+                            except Exception as e:
+                                bot.rpc.send_msg(accid, msg.chat_id, MsgData(text=f"Failed to add channel: {e}"))
+                        
+                        asyncio.run_coroutine_threadsafe(do_add(), bridge.loop)
+                    else:
+                        bot.rpc.send_msg(accid, msg.chat_id, MsgData(text="Telegram bridge not ready yet."))
+                    return
+
+            # If not admin and not password, just ignore or log
+            logger.debug(f"Ignoring message from {msg.from_id} in chat {msg.chat_id} (not a broadcast channel and not authorized)")
             return
 
         msg_type = "System" if msg.is_system else "Text"
@@ -350,6 +644,19 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
             break
     if proxy_cfg:
         apply_dc_proxy_config(rpc, acc_to_run, proxy_cfg)
+
+    # Ensure all configured channels are in the DB
+    for cfg in channels_to_mirror:
+        cid = cfg.get("chat_id")
+        if cid:
+            if not chan_repo.get_by_chat_id(acc_to_run, cid):
+                chan_repo.save(Channel(
+                    accid=acc_to_run,
+                    chat_id=cid,
+                    name=cfg.get("name", "Unknown"),
+                    photo_enabled=cfg.get("photo", {}).get("enable", True),
+                    video_enabled=cfg.get("video", {}).get("enable", True)
+                ))
 
     logger.info(f"Starting bot for account: {acc_to_run} (Listening on {len(channel_ids)} channels)")
     

@@ -15,6 +15,7 @@ The bot works by listening to new messages in a Telegram channel and relaying th
 - **Relay Pausing**: Automatically stops mirroring if the last recipient leaves the Delta Chat channel, and resumes when someone joins.
 - **Media Customization**: Enable/disable photo and video relaying per channel with custom placeholder messages.
 - **Automatic Sync**: Synchronizes channel name and avatar from Telegram to Delta Chat.
+- **Admin Commands**: Authenticated admins can list active channel links and add new channels to mirror dynamically via Delta Chat.
 
 ## Quick Start
 

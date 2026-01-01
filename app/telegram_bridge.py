@@ -2,9 +2,10 @@ import asyncio
 import os
 import logging
 from pathlib import Path
+import re
 from telethon import TelegramClient, events, utils
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ReadMentionsRequest
+from telethon.tl.functions.messages import ReadMentionsRequest, ImportChatInviteRequest, CheckChatInviteRequest, GetHistoryRequest
 from deltachat2 import MsgData, Rpc
 from logger import logger
 from models.message import Message
@@ -54,13 +55,53 @@ class TelegramBridge:
             except ValueError:
                 pass
 
-        try:
-            entity = await self.client.get_entity(target_chat)
+        entity = None
+        # Handle invite links
+        invite_link_match = re.search(r'(?:https?://)?(?:t\.me/(?:\+|(?:joinchat/)))([a-zA-Z0-9_-]+)', str(target_chat))
+        if invite_link_match:
+            hash = invite_link_match.group(1)
+            logger.info(f"Found Telegram invite link, attempting to join: {target_chat}")
+            invite_title = None
+            try:
+                # Check status first to get some info
+                invite_info = await self.client(CheckChatInviteRequest(hash))
+                if hasattr(invite_info, 'chat') and invite_info.chat: # ChatInviteAlready
+                    entity = invite_info.chat
+                elif hasattr(invite_info, 'title'): # ChatInvite
+                    invite_title = invite_info.title
+                
+                await self.client(ImportChatInviteRequest(hash))
+            except Exception as e:
+                if "USER_ALREADY_PARTICIPANT" in str(e):
+                    logger.info("Already a participant in the channel.")
+                else:
+                    logger.warning(f"Failed to join via invite link {hash}: {e}")
             
-            # Ensure member
+            # If we don't have entity yet, try to find it in dialogs by title (since we just joined)
+            if not entity and invite_title:
+                try:
+                    async for dialog in self.client.iter_dialogs(limit=50):
+                        if dialog.name == invite_title:
+                            entity = dialog.entity
+                            break
+                except Exception as e:
+                    logger.warning(f"Error searching dialogs after join: {e}")
+        
+        try:
+            if not entity:
+                # If target_chat is an invite link and couldn't be resolved, skip get_entity
+                if invite_link_match:
+                    logger.error(f"Could not resolve entity for invite link {target_chat}")
+                    return None
+                entity = await self.client.get_entity(target_chat)
+            
+            # Ensure member (for public channels or if we have entity but not in)
             if getattr(entity, 'left', False):
                 logger.info(f"Joining Telegram channel: {target_chat}")
-                await self.client(JoinChannelRequest(entity))
+                try:
+                    await self.client(JoinChannelRequest(entity))
+                except Exception as e:
+                    logger.warning(f"Could not join channel {target_chat}: {e}")
             
             actual_tg_id = utils.get_peer_id(entity)
             if channel_cfg.get('tgid') != actual_tg_id:
@@ -98,21 +139,22 @@ class TelegramBridge:
         
         accid = self.config.get('active_accid')
         
-        tg_to_dc_map = {}
-        target_chats = []
+        self.tg_to_dc_map = {}
+        self.target_chats = []
 
         for channel_cfg in self.channels_to_mirror:
             dc_chat_id = channel_cfg.get('chat_id')
             actual_tg_id = await self._resolve_and_join_channel(channel_cfg, accid)
             if actual_tg_id:
-                tg_to_dc_map[actual_tg_id] = channel_cfg
-                target_chats.append(actual_tg_id)
+                self.tg_to_dc_map[actual_tg_id] = channel_cfg
+                self.target_chats.append(actual_tg_id)
 
-        if not target_chats:
+        if not self.target_chats:
             logger.error("No valid Telegram channels to mirror.")
-            return
+            # We still want to run even if empty, as we might add dynamically
+            # return 
             
-        await self.start_listening(target_chats, tg_to_dc_map, accid)
+        await self.start_listening(accid)
 
     async def sync_channel_info(self, entity, dc_chat_id, accid):
         try:
@@ -140,13 +182,16 @@ class TelegramBridge:
         except Exception as e:
             logger.warning(f"General error in sync_channel_info: {e}")
 
-    async def start_listening(self, target_chats, tg_to_dc_map, accid):
-        @self.client.on(events.ChatAction(chats=target_chats))
+    async def start_listening(self, accid):
+        @self.client.on(events.ChatAction())
         async def chat_action_handler(event):
+            tg_id = event.chat_id
+            if tg_id not in self.target_chats:
+                return
+
             if event.new_photo or event.new_title:
                 try:
-                    tg_id = event.chat_id
-                    channel_cfg = tg_to_dc_map.get(tg_id)
+                    channel_cfg = self.tg_to_dc_map.get(tg_id)
                     if channel_cfg:
                         dc_chat_id = channel_cfg.get('chat_id')
                         logger.info(f"Telegram channel update detected (photo/title change) for {tg_id}")
@@ -155,31 +200,57 @@ class TelegramBridge:
                 except Exception as e:
                     logger.error(f"Error handling real-time Telegram update: {e}")
 
-        @self.client.on(events.NewMessage(chats=target_chats))
+        @self.client.on(events.NewMessage())
         async def handler(event):
             try:
                 tg_id = event.chat_id
-                channel_cfg = tg_to_dc_map.get(tg_id)
+                if tg_id not in self.target_chats:
+                    return
+
+                channel_cfg = self.tg_to_dc_map.get(tg_id)
                 if not channel_cfg:
                     return
-                dc_chat_id = channel_cfg.get('chat_id')
                 
-                photo_cfg = channel_cfg.get('photo', {})
-                photo_enabled = photo_cfg.get('enable', True)
-                photo_prefix = photo_cfg.get('message', '[Photo]')
-                
-                video_cfg = channel_cfg.get('video', {})
-                video_enabled = video_cfg.get('enable', True)
-                video_prefix = video_cfg.get('message', '[Video]')
-
                 await self.client.send_read_acknowledge(event.chat_id, event.message)
                 await self._relay_message(event.message, channel_cfg, accid)
                         
             except Exception as e:
                 logger.error(f"Error in Telegram handler: {e}")
 
-        logger.info(f"Telegram bridge is listening on {len(target_chats)} channels...")
+        logger.info(f"Telegram bridge is listening on {len(self.target_chats)} channels...")
         await self.client.run_until_disconnected()
+
+    async def add_dynamic_channel(self, channel_cfg, accid):
+        """Dynamically add a channel to mirror without restarting."""
+        actual_tg_id = await self._resolve_and_join_channel(channel_cfg, accid)
+        if actual_tg_id:
+            if actual_tg_id not in self.target_chats:
+                self.target_chats.append(actual_tg_id)
+                self.tg_to_dc_map[actual_tg_id] = channel_cfg
+                # Keep channels_to_mirror in sync for fetch_history
+                if channel_cfg not in self.channels_to_mirror:
+                    self.channels_to_mirror.append(channel_cfg)
+                logger.info(f"Dynamically added channel {actual_tg_id} to listening list.")
+            else:
+                logger.info(f"Channel {actual_tg_id} is already being mirrored.")
+        return actual_tg_id
+
+    async def remove_dynamic_channel(self, dc_chat_id):
+        """Stop mirroring a channel."""
+        tg_id_to_remove = None
+        for tg_id, cfg in self.tg_to_dc_map.items():
+            if cfg.get('chat_id') == dc_chat_id:
+                tg_id_to_remove = tg_id
+                break
+        
+        if tg_id_to_remove:
+            self.target_chats.remove(tg_id_to_remove)
+            del self.tg_to_dc_map[tg_id_to_remove]
+            # Remove from local list too
+            self.channels_to_mirror = [c for c in self.channels_to_mirror if c.get('chat_id') != dc_chat_id]
+            logger.info(f"Dynamically removed channel {tg_id_to_remove} (DC: {dc_chat_id}) from listening list.")
+            return True
+        return False
 
     async def _relay_message(self, message, channel_cfg, accid):
         try:
@@ -187,13 +258,7 @@ class TelegramBridge:
             if not dc_chat_id:
                 return None
             
-            # Check if channel is enabled in DB
-            if self.chan_repo:
-                chan = self.chan_repo.get_by_chat_id(accid, dc_chat_id)
-                if chan and not chan.enabled:
-                    logger.debug(f"Relay disabled for channel {dc_chat_id}, skipping message.")
-                    return None
-            
+            # Default from config
             photo_cfg = channel_cfg.get('photo', {})
             photo_enabled = photo_cfg.get('enable', True)
             photo_prefix = photo_cfg.get('message', '[Photo]')
@@ -201,6 +266,18 @@ class TelegramBridge:
             video_cfg = channel_cfg.get('video', {})
             video_enabled = video_cfg.get('enable', True)
             video_prefix = video_cfg.get('message', '[Video]')
+
+            # Override with DB settings if available
+            if self.chan_repo:
+                chan = self.chan_repo.get_by_chat_id(accid, dc_chat_id)
+                if chan:
+                    if not chan.enabled:
+                        logger.debug(f"Relay disabled for channel {dc_chat_id}, skipping message.")
+                        return None
+                    photo_enabled = chan.photo_enabled
+                    photo_prefix = chan.photo_message
+                    video_enabled = chan.video_enabled
+                    video_prefix = chan.video_message
 
             text = message.message
             media_path = None
@@ -312,7 +389,21 @@ class TelegramBridge:
 
         logger.info(f"Fetching last {limit} messages from Telegram for {tgid}...")
         try:
-            entity = await self.client.get_entity(tgid)
+            entity = None
+            try:
+                entity = await self.client.get_entity(tgid)
+            except Exception as e:
+                # If it's a private channel/permission error, try to refresh dialogs
+                if "private" in str(e).lower() or "permission" in str(e).lower():
+                    logger.info("Access denied to channel ID. Refreshing dialogs to see if it helps...")
+                    async for dialog in self.client.iter_dialogs(limit=50):
+                        if utils.get_peer_id(dialog.entity) == tgid:
+                            entity = dialog.entity
+                            break
+                
+                if not entity:
+                    raise e
+
             tg_messages = []
             # Scan more than limit to account for unbridgeable service messages
             # and ensure we get enough content.

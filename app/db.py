@@ -18,6 +18,11 @@ def init_db(db_path: str):
                 PRIMARY KEY (accid, chat_id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                contact_id INTEGER PRIMARY KEY
+            )
+        """)
         # Added dc_msg_id and dc_chat_id to store Delta Chat database ID and chat association
         conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (

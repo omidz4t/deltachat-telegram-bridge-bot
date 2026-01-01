@@ -1,5 +1,6 @@
 # General Settings
 debug: false
+admin_password: "CHANGEME" # Password to become an admin and use commands
 logging:
   level: INFO # DEBUG, INFO, WARNING, ERROR
   file: data/bot.log # Optional: log to file

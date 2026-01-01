@@ -73,3 +73,6 @@ class ChannelRepository:
                     enabled=bool(row[8])
                 )
         return None
+    def delete(self, accid: int, chat_id: int):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM channels WHERE accid = ? AND chat_id = ?", (accid, chat_id))
