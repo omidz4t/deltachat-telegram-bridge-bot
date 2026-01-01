@@ -23,6 +23,10 @@ The core table for tracking every message relayed between platforms.
 - `media_path`, `media_type`: Details about attached files.
 - `timestamp`: When the message was recorded.
 
+### 3. `admins` Table
+Stores the contact IDs of users who have successfully authenticated as administrators.
+- `contact_id`: Delta Chat contact ID.
+
 ## Multi-Channel Identification
 
 A critical aspect of the database is how it handles message IDs. 

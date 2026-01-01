@@ -23,7 +23,10 @@ When a join event is detected, the bot follows these steps:
    If the local database has fewer than `limit` "bridgeable" messages (text or media), the bot contacts Telegram.
    - It scans the Telegram channel (looking at up to 2x the limit).
    - It identifies the most recent bridgeable messages.
-   - It filters out "Service Messages" (like photo updates) that cannot be mirrored.
+       - It filters out "Service Messages" (like photo updates) that cannot be mirrored.
+
+    - **Access Fallback**: If access is denied (common for private channels where the session/cache might be stale), the bot automatically attempts to refresh its dialog list to re-establish access before retrying the fetch.
+
 
 4. **Batch Resending**:
    - **Existing Messages**: If a message exists in Delta Chat, the bot uses `rpc.resend_messages` in batches to efficiently deliver them to the new user.

@@ -54,7 +54,7 @@ Once a user is authenticated as an admin (by sending the `admin_password` to the
 
 - `/help`: Show a brief explanation of all available commands.
 - `/links`: Returns a list of all mirrored channels with their Delta Chat invite links, Chat IDs, and current media settings.
-- `/add CHANNEL_ID [NO_PHOTO] [NO_VIDEO]`: Adds a new Telegram channel to the mirror list. Optional flags `NO_PHOTO` and `NO_VIDEO` can be used to disable media relaying from the start.
+- `/add CHANNEL_ID [NO_PHOTO] [NO_VIDEO]`: Adds a new bridge. `CHANNEL_ID` can be a Telegram username (e.g., `@channel`), a numerical ID (e.g., `-100...`), or an **Invite Link** (e.g., `https://t.me/+...`). Using invite links is recommended for private channels. Optional flags `NO_PHOTO` and `NO_VIDEO` can be used to disable media relaying from the start.
 - `/link CHAT_ID [NO_PHOTO] [NO_VIDEO]`: Updates settings for an existing channel. `CHAT_ID` is the Delta Chat Chat ID (found in `/links`). Flags `NO_PHOTO` and `NO_VIDEO` will disable the respective media types. To re-enable, simply run the command without the flags (e.g., `/link CHAT_ID`).
 - `/photo CHAT_ID on|off`: Specifically enable or disable photo relaying for a channel.
 - `/video CHAT_ID on|off`: Specifically enable or disable video relaying for a channel.

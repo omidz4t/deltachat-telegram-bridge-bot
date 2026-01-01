@@ -10,8 +10,9 @@ The entry point of the application. It handles:
 - Starting the Telegram Bridge thread.
 - Managing the Delta Chat event loop.
 - **Admin Authentication**: Validates users using the `admin_password`.
-- **Command Dispatcher**: Handles `/links` and `/add` commands for authenticated admins.
-- Handling join events (`MemberAdded`, `SecureJoinQrScanSuccess`) to trigger history resending.
+- **Command Dispatcher**: Handles administrative tasks via commands like `/links`, `/add`, `/link`, `/delete`, `/photo`, and `/video`.
+- **Join Event Management**: Detects new members and triggers historical synchronization.
+- **Dynamic Updates**: Communicates with the Telegram Bridge to add or remove mirrored channels at runtime without a full bot restart.
 
 ### 2. Telegram Bridge (`app/telegram_bridge.py`)
 This component runs in a separate thread and manages the `Telethon` client.
@@ -19,6 +20,7 @@ This component runs in a separate thread and manages the `Telethon` client.
 - **Relaying**: Downloads media and sends messages to Delta Chat via the RPC interface.
 - **History Fetching**: Downloads historical messages from Telegram when triggered by Delta Chat join events.
 - **Syncing**: Periodically or on-demand syncs channel metadata (name, photo).
+- **Dynamic Mirroring**: Supports adding and removing target channels from its internal tracking list while the bridge is running.
 
 ### 3. Data Models (`app/models/`)
 - **`Channel`**: Represents a mirrored channel pairing, including Delta Chat `chat_id` and relay preferences.
