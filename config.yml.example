@@ -1,3 +1,9 @@
+# General Settings
+debug: false
+logging:
+  level: INFO # DEBUG, INFO, WARNING, ERROR
+  file: data/bot.log # Optional: log to file
+
 accounts:
 - accid: 1
   server: https://nine.testrun.org

@@ -6,6 +6,7 @@ import time
 import getpass
 import logging
 import signal
+import asyncio
 from threading import Thread
 from pathlib import Path
 from typing import Optional
@@ -13,7 +14,7 @@ from typing import Optional
 from deltachat2 import Bot, Rpc, IOTransport, EventType, CoreEvent, Event, MsgData, events, JsonRpcError
 from deltachat2.events import RawEvent, HookCollection
 
-from logger import logger
+from logger import logger, setup_logging
 from repository.channel_repository import ChannelRepository
 from repository.message_repository import MessageRepository
 from models.channel import Channel
@@ -179,9 +180,11 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
         # also need to add tgid/username if missing, but it might be hard here
     
     channel_ids = [c.get("chat_id") for c in channels_to_mirror if c.get("chat_id")]
+    chat_id_to_cfg = {c.get("chat_id"): c for c in channels_to_mirror if c.get("chat_id")}
     
     db_path = "data/db.sqlite"
     msg_repo = MessageRepository(db_path)
+    chan_repo = ChannelRepository(db_path)
 
     history_config = config.get("history_resend", {})
     history_enabled = history_config.get("enabled", False)
@@ -200,10 +203,34 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
         if not chat_id or chat_id not in channel_ids:
             return
 
+        if kind == "MsgFailed":
+            msg_id = event.get("msg_id")
+            if msg_id:
+                try:
+                    # Using get_message (not get_message_view) to fetch the message data
+                    msg = bot.rpc.get_message(accid, msg_id)
+                    # get_message_info returns a multiline string with detailed status (SMTP errors, etc.)
+                    info = bot.rpc.get_message_info(accid, msg_id)
+                    
+                    # msg is likely a dict or an object with a 'text' field
+                    text_snippet = "[No Text]"
+                    if isinstance(msg, dict):
+                        text_snippet = msg.get("text", "[No Text]")
+                    elif hasattr(msg, "text"):
+                        text_snippet = msg.text
+                    
+                    logger.error(f"Message {msg_id} in channel {chat_id} FAILED. Text snippet: {text_snippet[:50]}")
+                    logger.info(f"Detailed failure info for msg {msg_id}:\n{info}")
+                except Exception as e:
+                    logger.debug(f"Could not fetch failed message {msg_id}: {e}")
+            else:
+                logger.error(f"Channel {chat_id} has a MsgFailed event but no msg_id was provided in the event data.")
+            return
+
         logger.info(f"Channel {chat_id} has new event: {kind}")
 
         # Events that indicate a new member or a potential need for history resend
-        join_events = ("MemberAdded", "SecurejoinInviterProgress", "SecureJoinQrScanSuccess", "ChatModified")
+        join_events = ("MemberAdded", "SecurejoinInviterProgress", "SecureJoinQrScanSuccess")
         
         if kind in join_events:
             # For SecurejoinInviterProgress, only trigger when it reaches 100%
@@ -215,31 +242,87 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
                 # This covers the "accept it always" requirement.
                 bot.rpc.accept_chat(accid, chat_id)
                 bot.rpc.marknoticed_chat(accid, chat_id)
+                
+                # Re-enable if it was disabled
+                chan_repo.update_enabled(accid, chat_id, True)
+                logger.debug(f"Channel {chat_id} re-enabled due to join event.")
+
+                # History resend logic
+                if history_enabled:
+                    current_time = time.time()
+                    # Use cooldown to prevent infinite loops and spamming the channel
+                    if current_time - last_resend_times.get(chat_id, 0) < cooldown:
+                        logger.debug(f"Cooldown active for chat {chat_id}, skipping history resend.")
+                    else:
+                        logger.info(f"Join event detected in chat {chat_id} ({kind}). Preparing history resend...")
+                        try:
+                            valid_dc_msg_ids = []
+                            messages = msg_repo.get_latest(chat_id, limit=history_limit)
+                            for m in messages:
+                                # Verify the message still exists in DC
+                                try:
+                                    if bot.rpc.get_existing_msg_ids(accid, [m.dc_msg_id]):
+                                        valid_dc_msg_ids.append(m.dc_msg_id)
+                                    else:
+                                        logger.debug(f"Message {m.dc_msg_id} no longer exists in Delta Chat, skipping.")
+                                except Exception:
+                                    logger.debug(f"Message {m.dc_msg_id} no longer exists in Delta Chat, skipping.")
+
+                            # If we don't have enough VALID messages in DC, fetch from Telegram
+                            # fetch_history will handle both resending existing and relaying missing ones.
+                            if len(valid_dc_msg_ids) < history_limit:
+                                bridge = bridge_container.get('bridge')
+                                channel_cfg = chat_id_to_cfg.get(chat_id)
+                                if bridge and bridge.loop and channel_cfg:
+                                    tg_target = channel_cfg.get('tgid') or channel_cfg.get('username')
+                                    if tg_target:
+                                        logger.info(f"Insufficient local valid history ({len(valid_dc_msg_ids)}/{history_limit}). Triggering Telegram fetch for {tg_target}...")
+                                        # Record sync attempt before starting async task to prevent overlaps
+                                        last_resend_times[chat_id] = current_time
+                                        asyncio.run_coroutine_threadsafe(
+                                            bridge.fetch_history(tg_target, limit=history_limit, accid=accid),
+                                            bridge.loop
+                                        )
+                                        return
+                                    else:
+                                        logger.warning(f"Could not determine Telegram target for chat {chat_id}")
+                                elif not (bridge and bridge.loop):
+                                    logger.warning("Telegram bridge loop not ready yet, cannot fetch history.")
+                                elif not channel_cfg:
+                                    logger.warning(f"No channel configuration found for chat {chat_id}")
+
+                            if valid_dc_msg_ids:
+                                logger.info(f"Resending {len(valid_dc_msg_ids)} existing messages to channel {chat_id}...")
+                                bot.rpc.resend_messages(accid, valid_dc_msg_ids)
+                                last_resend_times[chat_id] = current_time
+                                logger.info("History resend complete.")
+                            else:
+                                logger.warning(f"No valid messages found to resend for channel {chat_id}")
+                                # Record attempt even if nothing found to avoid constant re-triggering
+                                last_resend_times[chat_id] = current_time
+                        except Exception as e:
+                            logger.error(f"Failed to handle history resend: {e}", exc_info=(logger.level <= logging.DEBUG))
             except Exception as e:
                 logger.debug(f"Could not accept/mark noticed chat {chat_id}: {e}")
 
-            # History resend logic
-            if history_enabled:
-                current_time = time.time()
-                # Use cooldown to prevent infinite loops and spamming the channel
-                if current_time - last_resend_times.get(chat_id, 0) < cooldown:
-                    return
+        # Handle leave events
+        leave_events = ("MemberRemoved", "ChatModified")
+        if kind in leave_events:
+            try:
+                contacts = bot.rpc.get_chat_contacts(accid, chat_id)
+                if not contacts:
+                    logger.info(f"No recipients left in channel {chat_id}. Disabling relay.")
+                    chan_repo.update_enabled(accid, chat_id, False)
+                else:
+                    # If we have members now, but it was disabled? 
+                    # Might be better to check status if contacts exist.
+                    chan = chan_repo.get_by_chat_id(accid, chat_id)
+                    if chan and not chan.enabled:
+                        logger.info(f"Recipients detected in channel {chat_id}, re-enabling relay.")
+                        chan_repo.update_enabled(accid, chat_id, True)
+            except Exception as e:
+                logger.debug(f"Error checking recipients for chat {chat_id}: {e}")
 
-                logger.info(f"Join/Modified event detected in chat {chat_id} ({kind}). Preparing history resend...")
-                
-                try:
-                    latest_msgs = msg_repo.get_latest(history_limit)
-                    dc_msg_ids = [m.dc_msg_id for m in latest_msgs if m.dc_msg_id]
-                    
-                    if dc_msg_ids:
-                        logger.info(f"Resending {len(dc_msg_ids)} messages to channel {chat_id}...")
-                        bot.rpc.resend_messages(accid, dc_msg_ids)
-                        last_resend_times[chat_id] = current_time
-                        logger.info("History resend complete.")
-                    else:
-                        logger.warning(f"No messages found in database to resend for channel {chat_id}")
-                except Exception as e:
-                    logger.error(f"Failed to handle history resend: {e}")
 
     @hooks.on(events.NewMessage)
     def handle_msg(bot, accid, event):
@@ -271,7 +354,8 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
     logger.info(f"Starting bot for account: {acc_to_run} (Listening on {len(channel_ids)} channels)")
     
     # Start Telegram Bridge in a separate thread, sharing the same RPC instance
-    t_thread = Thread(target=start_telegram_bridge, args=(config, rpc, msg_repo), daemon=True)
+    bridge_container = {}
+    t_thread = Thread(target=start_telegram_bridge, args=(config, rpc, msg_repo, chan_repo, bridge_container), daemon=True)
     t_thread.start()
 
     bot = Bot(rpc, hooks, logger)
@@ -303,8 +387,10 @@ def main():
     
     args = parser.parse_args()
     
+    config = load_config()
     if args.debug:
-        logger.setLevel(logging.DEBUG)
+        config["debug"] = True
+    setup_logging(config)
     
     data_dir = Path("data")
     data_dir.mkdir(exist_ok=True)

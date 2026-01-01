@@ -11,3 +11,4 @@ class Channel:
     photo_message: str = "[Photo]"
     video_enabled: bool = True
     video_message: str = "[Video]"
+    enabled: bool = True
