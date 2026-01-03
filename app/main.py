@@ -352,7 +352,7 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
                         "/help - Show this help message\n"
                         "/links - List all active mirrored channels with their DC Chat IDs and invite links\n"
                         "/add CHANNEL_ID [NO_PHOTO] [NO_VIDEO] - Add a new Telegram channel to mirror. "
-                        "CHANNEL_ID can be a username (e.g., @channel) or a tgid (e.g., -100...)\n"
+                        "CHANNEL_ID can be a username (@channel), tgid (-100...), or private invite link (https://t.me/+...)\n"
                         "/link CHAT_ID [NO_PHOTO] [NO_VIDEO] - Update media settings for an existing channel. "
                         "CHAT_ID is the Delta Chat ID from /links\n"
                         "/photo CHAT_ID on|off - Enable or disable photo relaying for a channel\n"
@@ -542,7 +542,7 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
                                 try:
                                     # Create a temporary config for resolution
                                     tmp_cfg = {}
-                                    if "t.me/" in tg_target or "+" in tg_target:
+                                    if any(domain in tg_target for domain in ["t.me/", "telegram.me/", "telegram.dog/"]) or "+" in tg_target:
                                         tmp_cfg["username"] = tg_target
                                     elif tg_target.startswith('-') or tg_target.isdigit():
                                         tmp_cfg["tgid"] = tg_target
@@ -596,6 +596,7 @@ def run_bot(rpc: Rpc, hooks: HookCollection):
                                     accid=accid,
                                     chat_id=dc_chat_id,
                                     name=tg_name,
+                                    link=tg_target if ("+" in tg_target or "joinchat" in tg_target) else None,
                                     photo_enabled=not no_photo,
                                     video_enabled=not no_video
                                 ))

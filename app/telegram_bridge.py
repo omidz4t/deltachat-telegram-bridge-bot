@@ -56,8 +56,9 @@ class TelegramBridge:
                 pass
 
         entity = None
-        # Handle invite links
-        invite_link_match = re.search(r'(?:https?://)?(?:t\.me/(?:\+|(?:joinchat/)))([a-zA-Z0-9_-]+)', str(target_chat))
+        # Handle invite links (private channels)
+        # Supports t.me/+, t.me/joinchat/, telegram.me/+, telegram.dog/+, etc.
+        invite_link_match = re.search(r'(?:https?://)?(?:t\.me|telegram\.(?:me|dog))/(?:\+|joinchat/)([a-zA-Z0-9_-]+)', str(target_chat))
         if invite_link_match:
             hash = invite_link_match.group(1)
             logger.info(f"Found Telegram invite link, attempting to join: {target_chat}")
@@ -70,20 +71,30 @@ class TelegramBridge:
                 elif hasattr(invite_info, 'title'): # ChatInvite
                     invite_title = invite_info.title
                 
-                await self.client(ImportChatInviteRequest(hash))
+                if not entity:
+                    updates = await self.client(ImportChatInviteRequest(hash))
+                    if hasattr(updates, 'chats') and updates.chats:
+                        entity = updates.chats[0]
+                    elif hasattr(updates, 'users') and updates.users:
+                        # Should be a chat, but just in case
+                        entity = updates.users[0]
             except Exception as e:
                 if "USER_ALREADY_PARTICIPANT" in str(e):
                     logger.info("Already a participant in the channel.")
+                    # If we can't get entity from CheckChatInviteRequest, we'll try to find it later
                 else:
                     logger.warning(f"Failed to join via invite link {hash}: {e}")
             
-            # If we don't have entity yet, try to find it in dialogs by title (since we just joined)
-            if not entity and invite_title:
+            # If we don't have entity yet, try to find it in dialogs (since we just joined or were already in)
+            if not entity:
                 try:
-                    async for dialog in self.client.iter_dialogs(limit=50):
-                        if dialog.name == invite_title:
+                    async for dialog in self.client.iter_dialogs(limit=100):
+                        # Try matching by title if we have it, or just hope get_peer_id works if we could somehow get it
+                        if invite_title and dialog.name == invite_title:
                             entity = dialog.entity
                             break
+                        # If it's a private chat/channel, it might be the only one with this hash in some internal state?
+                        # No, but we can't easily match hash to dialog.
                 except Exception as e:
                     logger.warning(f"Error searching dialogs after join: {e}")
         
