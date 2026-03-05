@@ -37,6 +37,7 @@ The bot works by listening to new messages in a Telegram channel and relaying th
 
 ## Documentation Sections
 
+- [**Getting Started**](getting_started.md): Step-by-step setup guide — from installation to running the bot.
 - [Architecture](architecture.md): Deep dive into the project structure and components.
 - [Configuration Guide](configuration.md): Detailed explanation of all `config.yml` settings.
 - [Database & Message Tracking](database.md): How the bot tracks messages and handles multi-channel IDs.

@@ -290,7 +290,7 @@ class TelegramBridge:
                     video_enabled = chan.video_enabled
                     video_prefix = chan.video_message
 
-            text = message.message
+            text = message.message or ""
             media_path = None
             media_type = "text"
             
@@ -310,6 +310,34 @@ class TelegramBridge:
                 # Handle other file types (stickers, documents, audio, etc.)
                 media_path = await message.download_media(file=str(self.media_dir))
                 media_type = "file"
+            
+            # Extract extra links (e.g., from buttons or formatted links)
+            extra_links = []
+            if message.entities:
+                for entity in message.entities:
+                    url = getattr(entity, 'url', None)
+                    if url and url not in extra_links and url not in text:
+                        extra_links.append(url)
+            
+            if message.buttons:
+                for row in message.buttons:
+                    for button in row:
+                        url = getattr(button, 'url', None)
+                        if url and url not in extra_links and url not in text:
+                            extra_links.append(url)
+
+            wp = getattr(message, 'web_preview', None)
+            if wp:
+                url = getattr(wp, 'url', None)
+                if url and url not in extra_links and url not in text:
+                    extra_links.append(url)
+
+            if extra_links:
+                links_text = "\n".join(extra_links)
+                if text:
+                    text = f"{text}\n\n{links_text}"
+                else:
+                    text = links_text
             
             if not (text or media_path):
                 logger.debug(f"Skipping message {message.id} - no supported content (text or media)")
@@ -420,7 +448,8 @@ class TelegramBridge:
             # and ensure we get enough content.
             async for msg in self.client.iter_messages(entity, limit=limit * 2):
                 # Only count messages that have bridgeable content (text or media)
-                if msg.message or msg.photo or msg.video or msg.file:
+                if msg.message or msg.photo or msg.video or msg.file or \
+                   msg.buttons or (msg.entities and any(getattr(e, 'url', None) for e in msg.entities)):
                     tg_messages.append(msg)
                     if len(tg_messages) >= limit:
                         break
